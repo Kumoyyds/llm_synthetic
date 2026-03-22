@@ -1,2 +1,2 @@
 # llm_synthetic
-This is for text imputation 
+This is for text text data augmentation
