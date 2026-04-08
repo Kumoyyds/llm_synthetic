@@ -1,6 +1,6 @@
 from sentence_transformers import SentenceTransformer
 import numpy as np
-from typing import List, Tuple, Union, Optional
+from typing import List, Tuple, Union, Optional, Dict
 import pickle
 from pathlib import Path
 
@@ -9,6 +9,7 @@ class SimilaritySearcher:
     Optimized similarity search using sentence-transformers.
     Pre-computes embeddings for the corpus for fast repeated queries.
     Supports caching embeddings to disk for persistent storage.
+    Cache stores text->embedding mapping for incremental updates.
     """
     
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
@@ -16,45 +17,61 @@ class SimilaritySearcher:
         self.corpus_embeddings = None
         self.corpus = None
         self.model_name = model_name
+        self._embedding_cache: Dict[str, np.ndarray] = {}  # text -> normalized embedding
     
     def fit(self, corpus: List[str], cache_path: Optional[str] = None) -> 'SimilaritySearcher':
         """
         Pre-compute embeddings for the corpus, with optional caching.
+        Supports incremental updates: cached embeddings are reused,
+        new texts are computed and added to the cache.
         
         Args:
             corpus: List of texts to search through
             cache_path: Optional path to save/load embeddings cache (.pkl file)
         """
         self.corpus = corpus
+        cache_updated = False
         
         # Try to load from cache
         if cache_path and Path(cache_path).exists():
-            print(f"Loading embeddings from cache: {cache_path}")
+            print(f"Loading embeddings cache: {cache_path}")
             with open(cache_path, 'rb') as f:
                 cached = pickle.load(f)
-                # Verify cache is valid (same corpus size and model)
-                if (cached.get('corpus_size') == len(corpus) and 
-                    cached.get('model_name') == self.model_name):
-                    self.corpus_embeddings = cached['embeddings']
-                    print(f"Loaded {len(corpus)} embeddings from cache")
-                    return self
+                # Check model compatibility
+                if cached.get('model_name') == self.model_name:
+                    self._embedding_cache = cached.get('text_to_embedding', {})
+                    print(f"Loaded {len(self._embedding_cache)} cached embeddings")
                 else:
-                    print("Cache invalid (corpus size or model changed), recomputing...")
+                    print(f"Cache model mismatch ({cached.get('model_name')} vs {self.model_name}), starting fresh...")
+                    self._embedding_cache = {}
         
-        # Compute embeddings
-        print(f"Computing embeddings for {len(corpus)} texts...")
-        self.corpus_embeddings = self.model.encode(corpus, convert_to_numpy=True, show_progress_bar=True)
-        # Normalize for cosine similarity
-        self.corpus_embeddings = self.corpus_embeddings / np.linalg.norm(self.corpus_embeddings, axis=1, keepdims=True)
+        # Identify texts that need embedding
+        texts_to_compute = [text for text in corpus if text not in self._embedding_cache]
+        cached_count = len(corpus) - len(texts_to_compute)
         
-        # Save to cache if path provided
-        if cache_path:
-            print(f"Saving embeddings to cache: {cache_path}")
+        if texts_to_compute:
+            print(f"Computing embeddings for {len(texts_to_compute)} new texts ({cached_count} from cache)...")
+            new_embeddings = self.model.encode(texts_to_compute, convert_to_numpy=True, show_progress_bar=True)
+            # Normalize for cosine similarity
+            new_embeddings = new_embeddings / np.linalg.norm(new_embeddings, axis=1, keepdims=True)
+            
+            # Update cache dict with new embeddings
+            for text, emb in zip(texts_to_compute, new_embeddings):
+                self._embedding_cache[text] = emb
+            cache_updated = True
+        else:
+            print(f"All {len(corpus)} embeddings loaded from cache")
+        
+        # Build corpus_embeddings array in corpus order
+        self.corpus_embeddings = np.array([self._embedding_cache[text] for text in corpus])
+        
+        # Save updated cache if needed
+        if cache_path and cache_updated:
+            print(f"Saving updated cache ({len(self._embedding_cache)} embeddings): {cache_path}")
             Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
             with open(cache_path, 'wb') as f:
                 pickle.dump({
-                    'embeddings': self.corpus_embeddings,
-                    'corpus_size': len(corpus),
+                    'text_to_embedding': self._embedding_cache,
                     'model_name': self.model_name
                 }, f)
         

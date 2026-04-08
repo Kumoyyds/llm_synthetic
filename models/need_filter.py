@@ -1,6 +1,8 @@
 import pandas as pd
 import json
 import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI  # Requires langchain-openai package
@@ -10,7 +12,7 @@ lite_llm_key_all = os.getenv('LITE_LLM_KEY_ALL')
 
 llm_model = ChatOpenAI(base_url='https://ipsos.litellm-prod.ai/',model='gpt-5', temperature=0.1, api_key=lite_llm_key_all)
 
-from typing import Literal, Union, Dict
+from typing import Literal, Union, Dict, List
 
 KPI_TYPE = Literal["relevance", "differentiation", "believability"]
 
@@ -62,11 +64,15 @@ def ai_filter(
         If return_reasoning=False: "yes" or "no"
         If return_reasoning=True: {"answer": "yes/no", "reasoning": "..."}
     """
-    
-    # Get KPI-specific question and criteria
+    messages = _build_messages(new_concept, kpi_type, system_info, return_reasoning)
+    ai_response = llm.invoke(messages)
+    return _parse_response(ai_response.content, return_reasoning)
+
+
+def _build_messages(new_concept: str, kpi_type: KPI_TYPE, system_info: dict, return_reasoning: bool) -> list:
+    """Helper to build messages for LLM call (shared by sync and async versions)."""
     kpi_config = KPI_QUESTIONS[kpi_type]
     
-    # Prepare consumer insights
     qneeds = []
     for q in ['qneed2', 'qneed3']:
         if q in system_info:
@@ -125,16 +131,17 @@ Think step by step:
 
 Output ONLY "yes" or "no" (lowercase, no punctuation or explanation)."""
     
-    messages = [
+    return [
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_query)
     ]
-    
-    ai_response = llm.invoke(messages)
-    response_text = ai_response.content.strip()
+
+
+def _parse_response(response_text: str, return_reasoning: bool) -> Union[str, dict]:
+    """Helper to parse LLM response (shared by sync and async versions)."""
+    response_text = response_text.strip()
     
     if return_reasoning:
-        # Parse reasoning and answer
         reasoning = ""
         answer = ""
         if "REASONING:" in response_text and "ANSWER:" in response_text:
@@ -142,9 +149,152 @@ Output ONLY "yes" or "no" (lowercase, no punctuation or explanation)."""
             reasoning = parts[0].replace("REASONING:", "").strip()
             answer = parts[1].strip().lower()
         else:
-            # Fallback: try to extract yes/no from the end
             answer = "yes" if "yes" in response_text.lower() else "no"
             reasoning = response_text
         return {"answer": answer, "reasoning": reasoning}
     else:
         return response_text.lower()
+
+
+async def ai_filter_async(
+    new_concept: str, 
+    kpi_type: KPI_TYPE, 
+    system_info: dict, 
+    llm = llm_model,
+    return_reasoning: bool = False
+) -> Union[str, dict]:
+    """
+    Async version of ai_filter for concurrent processing.
+    
+    Args:
+        new_concept: The product concept text to evaluate
+        kpi_type: One of "relevance", "differentiation", or "believability"
+        system_info: Dict containing consumer insights (qneed2, qneed3, insight)
+        llm: LLM model instance
+        return_reasoning: If True, return dict with 'answer' and 'reasoning'
+        
+    Returns:
+        If return_reasoning=False: "yes" or "no"
+        If return_reasoning=True: {"answer": "yes/no", "reasoning": "..."}
+    """
+    messages = _build_messages(new_concept, kpi_type, system_info, return_reasoning)
+    ai_response = await llm.ainvoke(messages)
+    return _parse_response(ai_response.content, return_reasoning)
+
+
+async def ai_filter_batch_async(
+    items: List[Dict],
+    llm = llm_model,
+    max_concurrency: int = 10,
+    show_progress: bool = False,
+    progress_desc: str = "AI filter"
+) -> List[Union[str, dict]]:
+    """
+    Process multiple filter requests concurrently using async.
+    
+    Args:
+        items: List of dicts, each containing:
+            - new_concept: str
+            - kpi_type: KPI_TYPE
+            - system_info: dict
+            - return_reasoning: bool (optional, default False)
+        llm: LLM model instance
+        max_concurrency: Maximum concurrent requests (default 10)
+        
+    Returns:
+        List of results in same order as input items
+        
+    Example:
+        items = [
+            {"new_concept": "concept1", "kpi_type": "relevance", "system_info": info1},
+            {"new_concept": "concept2", "kpi_type": "differentiation", "system_info": info2},
+        ]
+        results = asyncio.run(ai_filter_batch_async(items))
+    """
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def process_one(idx: int, item: dict) -> tuple[int, Union[str, dict]]:
+        async with semaphore:
+            result = await ai_filter_async(
+                new_concept=item["new_concept"],
+                kpi_type=item["kpi_type"],
+                system_info=item["system_info"],
+                llm=llm,
+                return_reasoning=item.get("return_reasoning", False),
+            )
+            return idx, result
+
+    tasks = [asyncio.create_task(process_one(i, item)) for i, item in enumerate(items)]
+    results: List[Union[str, dict]] = [None] * len(items)  # type: ignore[assignment]
+
+    if not show_progress:
+        pairs = await asyncio.gather(*tasks)
+        for idx, result in pairs:
+            results[idx] = result
+        return results
+
+    try:
+        from tqdm.auto import tqdm  # type: ignore
+    except Exception:
+        # tqdm not available; fall back to no progress.
+        pairs = await asyncio.gather(*tasks)
+        for idx, result in pairs:
+            results[idx] = result
+        return results
+
+    with tqdm(total=len(tasks), desc=progress_desc) as pbar:
+        for fut in asyncio.as_completed(tasks):
+            idx, result = await fut
+            results[idx] = result
+            pbar.update(1)
+    return results
+
+
+def ai_filter_batch(
+    items: List[Dict],
+    llm = llm_model,
+    max_concurrency: int = 10,
+    show_progress: bool = False,
+    progress_desc: str = "AI filter"
+) -> List[Union[str, dict]]:
+    """
+    Synchronous wrapper for batch processing (runs async internally).
+    
+    Args:
+        items: List of dicts, each containing:
+            - new_concept: str
+            - kpi_type: KPI_TYPE
+            - system_info: dict
+            - return_reasoning: bool (optional, default False)
+        llm: LLM model instance
+        max_concurrency: Maximum concurrent requests (default 10)
+        
+    Returns:
+        List of results in same order as input items
+        
+    Example:
+        items = [
+            {"new_concept": "concept1", "kpi_type": "relevance", "system_info": info1},
+            {"new_concept": "concept2", "kpi_type": "differentiation", "system_info": info2},
+        ]
+        results = ai_filter_batch(items)
+    """
+    # In notebooks (IPython/Jupyter), an event loop is already running.
+    # asyncio.run() cannot be used there; callers should use:
+    #   batch_results = await ai_filter_batch_async(...)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            ai_filter_batch_async(
+                items,
+                llm=llm,
+                max_concurrency=max_concurrency,
+                show_progress=show_progress,
+                progress_desc=progress_desc,
+            )
+        )
+    raise RuntimeError(
+        "ai_filter_batch() cannot be called from a running event loop (e.g., Jupyter). "
+        "Use: `batch_results = await ai_filter_batch_async(items, llm=..., max_concurrency=...)`."
+    )
