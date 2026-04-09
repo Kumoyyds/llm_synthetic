@@ -34,15 +34,15 @@ class SimilaritySearcher:
         
         # Try to load from cache
         if cache_path and Path(cache_path).exists():
-            print(f"Loading embeddings cache: {cache_path}")
+            # print(f"Loading embeddings cache: {cache_path}")
             with open(cache_path, 'rb') as f:
                 cached = pickle.load(f)
                 # Check model compatibility
                 if cached.get('model_name') == self.model_name:
                     self._embedding_cache = cached.get('text_to_embedding', {})
-                    print(f"Loaded {len(self._embedding_cache)} cached embeddings")
+                    # print(f"Loaded {len(self._embedding_cache)} cached embeddings")
                 else:
-                    print(f"Cache model mismatch ({cached.get('model_name')} vs {self.model_name}), starting fresh...")
+                    # print(f"Cache model mismatch ({cached.get('model_name')} vs {self.model_name}), starting fresh...")
                     self._embedding_cache = {}
         
         # Identify texts that need embedding
@@ -60,7 +60,8 @@ class SimilaritySearcher:
                 self._embedding_cache[text] = emb
             cache_updated = True
         else:
-            print(f"All {len(corpus)} embeddings loaded from cache")
+            # print(f"All {len(corpus)} embeddings loaded from cache")
+            pass
         
         # Build corpus_embeddings array in corpus order
         self.corpus_embeddings = np.array([self._embedding_cache[text] for text in corpus])
