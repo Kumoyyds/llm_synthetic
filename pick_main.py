@@ -35,7 +35,7 @@ id_to_processs = list(response_table['ids'].unique())
 
 split_num = 300
 
-for i in tqdm(range(16, split_num)):
+for i in tqdm(range(28, split_num)):
     batch_ids = id_to_processs[i*len(id_to_processs)//split_num : (i+1)*len(id_to_processs)//split_num]
     result = asyncio.run(concept_pk.process_all(respondent_ids = batch_ids, show_progress=False))
     result.to_excel(f"./data/pricking_results/picking_result_{i}.xlsx", index=False)

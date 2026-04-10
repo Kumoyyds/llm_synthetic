@@ -3,6 +3,27 @@ import numpy as np
 from typing import List, Tuple, Union, Optional, Dict
 import pickle
 from pathlib import Path
+import threading
+
+# Global lock for thread-safe model operations
+_model_lock = threading.Lock()
+
+# Shared model cache - singleton pattern for thread safety
+_model_cache: Dict[str, SentenceTransformer] = {}
+
+
+def _get_shared_model(model_name: str, device: str = None) -> SentenceTransformer:
+    """
+    Get or create a shared SentenceTransformer model instance.
+    Thread-safe singleton pattern to avoid multiple model instantiations.
+    """
+    global _model_cache
+    with _model_lock:
+        if model_name not in _model_cache:
+            print(f"Loading model: {model_name} (device: {device or 'auto'})")
+            _model_cache[model_name] = SentenceTransformer(model_name, device=device)
+        return _model_cache[model_name]
+
 
 class SimilaritySearcher:
     """
@@ -10,10 +31,16 @@ class SimilaritySearcher:
     Pre-computes embeddings for the corpus for fast repeated queries.
     Supports caching embeddings to disk for persistent storage.
     Cache stores text->embedding mapping for incremental updates.
+    Uses a shared model instance for thread safety.
     """
     
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        self.model = SentenceTransformer(model_name)
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", device: str = None):
+        """
+        Args:
+            model_name: Name of the sentence-transformer model
+            device: Device to use ('cuda', 'cpu', or None for auto)
+        """
+        self.model = _get_shared_model(model_name, device)
         self.corpus_embeddings = None
         self.corpus = None
         self.model_name = model_name
@@ -51,7 +78,8 @@ class SimilaritySearcher:
         
         if texts_to_compute:
             print(f"Computing embeddings for {len(texts_to_compute)} new texts ({cached_count} from cache)...")
-            new_embeddings = self.model.encode(texts_to_compute, convert_to_numpy=True, show_progress_bar=True)
+            with _model_lock:
+                new_embeddings = self.model.encode(texts_to_compute, convert_to_numpy=True, show_progress_bar=True)
             # Normalize for cosine similarity
             new_embeddings = new_embeddings / np.linalg.norm(new_embeddings, axis=1, keepdims=True)
             
@@ -94,8 +122,9 @@ class SimilaritySearcher:
         if self.corpus_embeddings is None:
             raise ValueError("Must call fit() with corpus before searching")
         
-        # Encode query
-        query_embedding = self.model.encode([query], convert_to_numpy=True)
+        # Encode query (thread-safe)
+        with _model_lock:
+            query_embedding = self.model.encode([query], convert_to_numpy=True)
         query_embedding = query_embedding / np.linalg.norm(query_embedding, axis=1, keepdims=True)
         
         # Compute cosine similarities (dot product since normalized)

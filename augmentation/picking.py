@@ -7,6 +7,7 @@ import pandas as pd
 import json
 from typing import Dict, List, Optional, Literal, Tuple
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from models import similar as sm
 from models import need_filter as nf
@@ -140,12 +141,58 @@ class ConceptPicker:
 
         return candidates
 
+    def _process_single_concept(
+        self,
+        concept_id: str,
+        original_answer: str,
+        kpi: str,
+        process_type: str,
+        respondent_info: Dict
+    ) -> Tuple[List[str], str, str, str]:
+        """
+        Process a single concept to find candidates. Thread-safe helper for parallel execution.
+        
+        Returns:
+            Tuple of (candidates, pick_answer, ob_type, concept_id)
+        """
+        # Get query info
+        query_cate = self.food_concepts[concept_id]['concept_Cate']
+        query_content = self.food_concepts[concept_id]['concept_content']
+
+        # Find suitable categories for contra
+        suitable_cates = None
+        if process_type == 'contra':
+            top_results, _ = self.searcher_cate.search(query_cate, top_n=5, bottom_m=0)
+            suitable_cates = {c[0] for c in top_results if c[1] >= self.cate_match_bound}
+
+        # Get filtered concepts
+        filtered_df = self._get_filtered_concepts(
+            kpi, original_answer, process_type, suitable_cates
+        )
+
+        if filtered_df.empty:
+            return [], '', '', concept_id
+
+        # Find candidates
+        candidates = self._find_candidates(query_content, filtered_df, process_type)
+
+        # Determine expected answer and ob_type
+        if process_type == 'contra':
+            pick_answer = 'no' if original_answer == 'yes' else 'yes'
+            ob_type = 'synthetic_contra'
+        else:
+            pick_answer = original_answer
+            ob_type = 'synthetic_same'
+
+        return candidates, pick_answer, ob_type, concept_id
+
     async def process_respondent_kpi(
         self,
         respondent_id: str,
         kpi: str,
-        max_concurrency: int = 6,
-        show_progress: bool = False
+        max_concurrency: int = 4,
+        show_progress: bool = False,
+        parallel_workers: int = 6
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Process a single respondent + KPI combination.
@@ -155,6 +202,7 @@ class ConceptPicker:
             kpi: One of "relevance", "differentiation", "believability"
             max_concurrency: Max concurrent AI filter requests
             show_progress: Show tqdm progress bar
+            parallel_workers: Number of parallel workers for similarity matching (default: 4)
 
         Returns:
             Tuple of (real_df, synthetic_df) DataFrames
@@ -182,34 +230,43 @@ class ConceptPicker:
             'ob_type': [],
             'corresponding_concept': []
         }
+        try: 
+            respondent_info = self.transformed_respondent[respondent_id]
+        except KeyError:
+            print(f"Warning: Respondent ID {respondent_id} not found in transformed_respondent")
+            return pd.DataFrame(), pd.DataFrame()
 
-        respondent_info = self.transformed_respondent[respondent_id]
+        # Prepare tasks for parallel similarity matching
+        concept_tasks = [
+            (str(sub.iloc[i]['concept']), sub.iloc[i]['answer'])
+            for i in range(len(sub))
+        ]
 
-        for i in range(len(sub)):
-            item = sub.iloc[i]
-            concept_id = str(item['concept'])
-            original_answer = item['answer']
+        # Run similarity matching in parallel using ThreadPoolExecutor
+        similarity_results = []
+        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._process_single_concept,
+                    concept_id,
+                    original_answer,
+                    kpi,
+                    process_type,
+                    respondent_info
+                ): (concept_id, original_answer)
+                for concept_id, original_answer in concept_tasks
+            }
+            
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    similarity_results.append(result)
+                except Exception as e:
+                    concept_id = futures[future][0]
+                    print(f"Warning: Failed to process concept {concept_id}: {e}")
 
-            # Get query info
-            query_cate = self.food_concepts[concept_id]['concept_Cate']
-            query_content = self.food_concepts[concept_id]['concept_content']
-
-            # Find suitable categories for contra
-            suitable_cates = None
-            if process_type == 'contra':
-                top_results, _ = self.searcher_cate.search(query_cate, top_n=5, bottom_m=0)
-                suitable_cates = {c[0] for c in top_results if c[1] >= self.cate_match_bound}
-
-            # Get filtered concepts
-            filtered_df = self._get_filtered_concepts(
-                kpi, original_answer, process_type, suitable_cates
-            )
-
-            if filtered_df.empty:
-                continue
-
-            # Find candidates
-            candidates = self._find_candidates(query_content, filtered_df, process_type)
+        # Process all candidates through AI filter
+        for candidates, pick_answer, ob_type, concept_id in similarity_results:
             if not candidates:
                 continue
 
@@ -229,16 +286,8 @@ class ConceptPicker:
                 items,
                 max_concurrency=max_concurrency,
                 show_progress=show_progress,
-                progress_desc=f"AI filter ({process_type})"
+                progress_desc=f"AI filter ({ob_type})"
             )
-
-            # Determine expected answer
-            if process_type == 'contra':
-                pick_answer = 'no' if original_answer == 'yes' else 'yes'
-                ob_type = 'synthetic_contra'
-            else:
-                pick_answer = original_answer
-                ob_type = 'synthetic_same'
 
             # Collect matching results
             for k, result in enumerate(batch_results):
@@ -258,7 +307,8 @@ class ConceptPicker:
         respondent_ids: Optional[List[str]] = None,
         kpis: Optional[List[str]] = None,
         max_concurrency: int = 4,
-        show_progress: bool = True
+        show_progress: bool = True,
+        parallel_workers: int = 4
     ) -> pd.DataFrame:
         """
         Process all respondent + KPI combinations.
@@ -268,6 +318,7 @@ class ConceptPicker:
             kpis: List of KPIs to process (default: all)
             max_concurrency: Max concurrent AI filter requests
             show_progress: Show progress bar
+            parallel_workers: Number of parallel workers for similarity matching
 
         Returns:
             Combined DataFrame with real and synthetic observations
@@ -290,7 +341,8 @@ class ConceptPicker:
         for resp_id in respondent_ids:
             for kpi in kpis:
                 real_df, synthetic_df = await self.process_respondent_kpi(
-                    resp_id, kpi, max_concurrency=max_concurrency, show_progress=False
+                    resp_id, kpi, max_concurrency=max_concurrency, 
+                    show_progress=False, parallel_workers=parallel_workers
                 )
                 if not real_df.empty:
                     all_results.append(real_df)
