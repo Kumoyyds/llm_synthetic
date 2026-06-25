@@ -249,6 +249,7 @@ CRITICAL RULES - PRESERVE KEY INFORMATION:
 6. Ensure the text flows naturally and reads well while strictly preserving core content.
 7. {price_insert}
 8. {brand_insert}
+9. ALWAYS respond in the same language as the original concept content text.
 """
 
         human_prompt = """Original text to rephrase:
